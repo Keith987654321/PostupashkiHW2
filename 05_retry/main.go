@@ -5,6 +5,7 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -16,29 +17,25 @@ const (
 	requestTimeout     = 5 * time.Second
 	baseDelay          = 200 * time.Millisecond
 	maxDelay           = 2000 * time.Millisecond
+	maxRetryAfter      = 30 * time.Second
+	maxDrainBytes      = 1 << 20
 )
 
-func doRequest(client *http.Client, method string, url string, idempotencyKey string) (int, time.Duration, error) {
-	req, err := http.NewRequest(method, url, nil)
-	if err != nil {
-		return 0, 0, err
-	}
-
-	if idempotencyKey != "" {
-		req.Header.Set("Idempotency-Key", idempotencyKey)
-	}
-
+func doRequest(client *http.Client, template *http.Request) (int, time.Duration, bool, error) {
+	req := template.Clone(template.Context())
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, false, err
 	}
 
-	_, _ = io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
+	retryAfter, hasRetryAfter := parseRetryAfter(
+		resp.Header.Get("Retry-After"),
+	)
 
-	retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
+	_, _ = io.CopyN(io.Discard, resp.Body, maxDrainBytes)
+	_ = resp.Body.Close()
 
-	return resp.StatusCode, retryAfter, nil
+	return resp.StatusCode, retryAfter, hasRetryAfter, nil
 }
 
 func shouldRetryStatus(status int) bool {
@@ -50,152 +47,247 @@ func shouldRetryStatus(status int) bool {
 	}
 }
 
-func calculateDelay(nextAttempt int, retryAfter time.Duration, rng *rand.Rand) time.Duration {
-	if retryAfter > 0 {
-		return retryAfter
+func calculateDelay(nextAttempt int, retryAfter time.Duration, hasRetryAfter bool) time.Duration {
+	if hasRetryAfter {
+		if retryAfter > maxRetryAfter {
+			retryAfter = maxRetryAfter
+		}
+		return retryAfter.Truncate(time.Millisecond)
 	}
 
-	// min(2000, 200 * 2^(n-1))
-	delay := 200
-	for i := 1; i < nextAttempt; i++ {
-		delay *= 2
-		if delay >= 2000 {
-			delay = 2000
+	shift := nextAttempt - 2
+	if shift < 0 {
+		shift = 0
+	}
+
+	maxShift := 0
+	for baseDelay*(1<<maxShift) < maxDelay {
+		maxShift++
+	}
+
+	if shift > maxShift {
+		shift = maxShift
+	}
+
+	delay := min(maxDelay, baseDelay*time.Duration(1<<shift))
+	maxMillis := delay.Milliseconds()
+
+	return time.Duration(rand.Int63n(maxMillis+1)) * time.Millisecond
+}
+
+func parseRetryAfter(value string) (time.Duration, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, false
+	}
+
+	isDigits := true
+	for i := 0; i < len(value); i++ {
+		if value[i] < '0' || value[i] > '9' {
+			isDigits = false
 			break
 		}
 	}
 
-	return time.Duration(rng.Int63n(int64(delay)+1)) * time.Millisecond
-}
+	if isDigits {
+		seconds, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return maxRetryAfter, true
+		}
 
-func parseRetryAfter(value string) time.Duration {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return 0
+		delay := time.Duration(0)
+		if seconds > int64(maxRetryAfter/time.Second) {
+			delay = maxRetryAfter
+		} else {
+			delay = time.Duration(seconds) * time.Second
+		}
+
+		return delay, true
 	}
 
-	seconds, err := strconv.Atoi(value)
-	if err != nil || seconds < 0 {
-		return 0
+	retryTime, err := http.ParseTime(value)
+	if err != nil {
+		return 0, false
 	}
 
-	return time.Duration(seconds) * time.Second
+	delay := time.Until(retryTime)
+	if delay < 0 {
+		delay = 0
+	}
+	if delay > maxRetryAfter {
+		delay = maxRetryAfter
+	}
+
+	return delay.Truncate(time.Millisecond), true
 }
 
 func errorText(err error) string {
-	return strings.ReplaceAll(err.Error(), "\n", " ")
+	return strings.Join(strings.Fields(err.Error()), " ")
 }
 
-func isHTTPURL(url string) bool {
-	return strings.HasPrefix(strings.ToLower(url), "http://")
-}
-
-func main() {
-	args := os.Args[1:]
-
-	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "no arguments")
-		os.Exit(1)
+func validateURL(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return err
 	}
 
-	url := args[0]
+	if strings.ToLower(u.Scheme) != "http" || u.Host == "" {
+		return fmt.Errorf("only valid http URLs are supported")
+	}
 
-	method := "GET"
+	return nil
+}
+
+func isIdempotentMethod(method string) bool {
+	switch method {
+	case http.MethodGet,
+		http.MethodHead,
+		http.MethodPut,
+		http.MethodDelete,
+		http.MethodOptions,
+		http.MethodTrace:
+		return true
+	default:
+		return false
+	}
+}
+
+func parseArgs(args []string) (string, string, int, string, bool, error) {
+	if len(args) == 0 {
+		return "", "", 0, "", false, fmt.Errorf("no arguments")
+	}
+
+	rawURL := args[0]
+	method := http.MethodGet
 	maxAttempts := defaultMaxAttempts
 	idempotencyKey := ""
+	maxAttemptsSpecified := false
 
 	for i := 1; i < len(args); i++ {
-		switch args[i] {
-		case "--method":
-			if i+1 >= len(args) {
-				fmt.Fprintln(os.Stderr, "missing value for method")
-				os.Exit(1)
-			}
-			method = strings.ToUpper(args[i+1])
-			i++
+		arg := args[i]
+		name, value, hasEquals := strings.Cut(arg, "=")
 
-		case "--max-attempts":
-			if i+1 >= len(args) {
-				fmt.Fprintln(os.Stderr, "missing value for max-attempts")
-				os.Exit(1)
+		switch name {
+		case "--method", "--max-attempts", "--idempotency-key":
+			if !hasEquals {
+				if i+1 >= len(args) {
+					return "", "", 0, "", false,
+						fmt.Errorf("missing value for %s", name)
+				}
+				i++
+				value = args[i]
 			}
-			value, err := strconv.Atoi(args[i+1])
-			if err != nil || value < 1 {
-				fmt.Fprintln(os.Stderr, "invalid max-attempts")
-				os.Exit(1)
-			}
-			maxAttempts = value
-			i++
 
-		case "--idempotency-key":
-			if i+1 >= len(args) {
-				fmt.Fprintln(os.Stderr, "missing value for idempotency-key")
-				os.Exit(1)
+			switch name {
+			case "--method":
+				method = strings.ToUpper(value)
+				if method == "" {
+					return "", "", 0, "", false,
+						fmt.Errorf("empty method")
+				}
+			case "--max-attempts":
+				n, err := strconv.Atoi(value)
+				if err != nil || n < 1 {
+					return "", "", 0, "", false,
+						fmt.Errorf("invalid max-attempts")
+				}
+				maxAttempts = n
+				maxAttemptsSpecified = true
+			case "--idempotency-key":
+				idempotencyKey = value
 			}
-			idempotencyKey = args[i+1]
-			i++
-
 		default:
-			fmt.Fprintln(os.Stderr, "unknown argument:", args[i])
-			os.Exit(1)
+			return "", "", 0, "", false,
+				fmt.Errorf("unknown argument: %s", arg)
 		}
 	}
 
-	if !isHTTPURL(url) {
-		fmt.Fprintln(os.Stderr, "only http scheme supported")
+	return rawURL, method, maxAttempts, idempotencyKey,
+		maxAttemptsSpecified, nil
+}
+
+func main() {
+	rawURL, method, maxAttempts, idempotencyKey,
+		maxAttemptsSpecified, err := parseArgs(os.Args[1:])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 
-	if method == "POST" && idempotencyKey == "" {
+	if err := validateURL(rawURL); err != nil {
+		fmt.Fprintln(os.Stderr, "invalid URL:", errorText(err))
+		os.Exit(1)
+	}
+
+	template, err := http.NewRequest(method, rawURL, nil)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "invalid request:", errorText(err))
+		os.Exit(1)
+	}
+
+	if idempotencyKey != "" {
+		template.Header.Set("Idempotency-Key", idempotencyKey)
+	}
+
+	if !isIdempotentMethod(method) && idempotencyKey == "" {
+		if maxAttemptsSpecified && maxAttempts > 1 {
+			fmt.Fprintln(
+				os.Stderr,
+				"non-idempotent method without Idempotency-Key: retries disabled",
+			)
+		}
 		maxAttempts = 1
 	}
 
 	client := &http.Client{
 		Timeout: requestTimeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
 
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-
 	success := false
-	attempts := 0
+	attempt := 0
 
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		attempts = attempt
-		status, retryAfter, err := doRequest(client, method, url, idempotencyKey)
-		if err != nil {
-			fmt.Printf("attempt %d error %s\n", attempt, errorText(err))
-			if attempt == maxAttempts {
+	for attempt < maxAttempts {
+		attempt++
+
+		status, retryAfter, hasRetryAfter, requestErr :=
+			doRequest(client, template)
+
+		retryable := requestErr != nil
+
+		if requestErr != nil {
+			fmt.Printf("attempt %d error %s\n", attempt, errorText(requestErr))
+		} else {
+			fmt.Printf("attempt %d status %d\n", attempt, status)
+
+			if status >= 200 && status <= 399 {
+				success = true
 				break
 			}
-			delay := calculateDelay(attempt+1, retryAfter, rng)
-			fmt.Printf("sleep_ms %d\n", delay.Milliseconds())
-			time.Sleep(delay)
-			continue
+
+			retryable = shouldRetryStatus(status)
 		}
 
-		fmt.Printf("attempt %d status %d\n", attempt, status)
-
-		if status >= 200 && status <= 399 {
-			success = true
-			break
-		}
-		if !shouldRetryStatus(status) {
-			break
-		}
-		if attempt == maxAttempts {
+		if !retryable || attempt == maxAttempts {
 			break
 		}
 
-		delay := calculateDelay(attempt+1, retryAfter, rng)
+		if hasRetryAfter && retryAfter > maxRetryAfter {
+			break
+		}
+
+		delay := calculateDelay(attempt+1, retryAfter, hasRetryAfter)
 		fmt.Printf("sleep_ms %d\n", delay.Milliseconds())
 		time.Sleep(delay)
 	}
 
 	if success {
-		fmt.Printf("result success attempts %d\n", attempts)
-		os.Exit(0)
+		fmt.Printf("result success attempts %d\n", attempt)
+		return
 	}
 
-	fmt.Printf("result failure attempts %d\n", attempts)
+	fmt.Printf("result failure attempts %d\n", attempt)
 	os.Exit(1)
 }
