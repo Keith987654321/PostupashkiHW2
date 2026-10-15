@@ -69,8 +69,18 @@ func parseMessage(data []byte) (*Message, error) {
 			}
 		}
 
+		reason := parts[2]
+
+		for i := 0; i < len(reason); i++ {
+			c := reason[i]
+
+			if (c < 0x20 && c != '\t') || c == 0x7f {
+				return nil, errBadStartLine
+			}
+		}
+
 		msg.Status = parts[1]
-		msg.Reason = parts[2]
+		msg.Reason = reason
 	} else {
 		parts := strings.SplitN(startLine, " ", 3)
 		if len(parts) != 3 {
@@ -98,10 +108,12 @@ func parseMessage(data []byte) (*Message, error) {
 	}
 
 	headerStart := startEnd + 2
+
 	separatorRelative := bytes.Index(
 		data[startEnd:],
 		[]byte("\r\n\r\n"),
 	)
+
 	if separatorRelative == -1 {
 		return nil, errBadHeader
 	}
@@ -110,7 +122,11 @@ func parseMessage(data []byte) (*Message, error) {
 	headerEnd := separatorStart
 	bodyStart := separatorStart + 4
 
-	headerData := data[headerStart:headerEnd]
+	var headerData []byte
+
+	if headerEnd >= headerStart {
+		headerData = data[headerStart:headerEnd]
+	}
 
 	if len(headerData) > 0 {
 		headerLines := bytes.Split(headerData, []byte("\r\n"))
